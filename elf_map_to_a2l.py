@@ -19,6 +19,8 @@ class ElfParser:
         self.arch = ""
         self.endian = ""
         self.entry_point = 0
+        self.dwarf_type_map = {}
+        self.func_names = set()
 
     def parse(self):
         with open(self.elf_path, "rb") as f:
@@ -36,6 +38,8 @@ class ElfParser:
                     "flags": section["sh_flags"],
                 }
                 self.sections.append(sec_info)
+
+            self._build_dwarf_type_map(elf)
 
             for section in elf.iter_sections():
                 if isinstance(section, SymbolTableSection):
@@ -62,6 +66,10 @@ class ElfParser:
             return None
         if sym_type == "STT_SECTION":
             return None
+        if sym_type == "STT_FUNC":
+            if name:
+                self.func_names.add(name)
+            return None
 
         section_name = ""
         shndx = symbol["st_shndx"]
@@ -87,14 +95,72 @@ class ElfParser:
             "category": category,
         }
 
-    def _get_dwarf_type(self, symbol, elf):
+    def _build_dwarf_type_map(self, elf):
         try:
             dwarf_info = elf.get_dwarf_info()
             if dwarf_info is None:
-                return ""
+                return
+        except Exception:
+            return
+
+        for CU in dwarf_info.iter_CUs():
+            top_die = CU.get_top_DIE()
+            self._walk_dwarf_dies(top_die)
+
+    def _walk_dwarf_dies(self, die):
+        if die.tag == "DW_TAG_variable":
+            name_attr = die.attributes.get("DW_AT_name")
+            type_attr = die.attributes.get("DW_AT_type")
+            if name_attr and type_attr:
+                name = name_attr.value.decode("utf-8", errors="ignore")
+                type_str = self._resolve_dwarf_type(die.cu, type_attr.value)
+                if type_str:
+                    self.dwarf_type_map[name] = type_str
+
+        if die.tag == "DW_TAG_formal_parameter":
+            name_attr = die.attributes.get("DW_AT_name")
+            type_attr = die.attributes.get("DW_AT_type")
+            if name_attr and type_attr:
+                name = name_attr.value.decode("utf-8", errors="ignore")
+                type_str = self._resolve_dwarf_type(die.cu, type_attr.value)
+                if type_str:
+                    self.dwarf_type_map[name] = type_str
+
+        for child in die.iter_children():
+            self._walk_dwarf_dies(child)
+
+    def _resolve_dwarf_type(self, cu, type_offset):
+        try:
+            type_die = cu.get_DIE_from_refaddr(type_offset)
         except Exception:
             return ""
+
+        name_attr = type_die.attributes.get("DW_AT_name")
+        if name_attr:
+            return name_attr.value.decode("utf-8", errors="ignore")
+
+        if type_die.tag == "DW_TAG_typedef":
+            type_attr = type_die.attributes.get("DW_AT_type")
+            if type_attr:
+                return self._resolve_dwarf_type(cu, type_attr.value)
+
+        if type_die.tag == "DW_TAG_const_type":
+            type_attr = type_die.attributes.get("DW_AT_type")
+            if type_attr:
+                inner = self._resolve_dwarf_type(cu, type_attr.value)
+                return f"const {inner}" if inner else ""
+
+        if type_die.tag == "DW_TAG_volatile_type":
+            type_attr = type_die.attributes.get("DW_AT_type")
+            if type_attr:
+                inner = self._resolve_dwarf_type(cu, type_attr.value)
+                return f"volatile {inner}" if inner else ""
+
         return ""
+
+    def _get_dwarf_type(self, symbol, elf):
+        name = symbol.name
+        return self.dwarf_type_map.get(name, "")
 
     def _classify_symbol(self, sym_type, sym_bind, size, section_name):
         if size == 0:
@@ -352,6 +418,8 @@ class A2LGenerator:
         for sym in map_symbols:
             name = sym["name"]
             if name not in merged_symbols:
+                if name in self.elf.func_names:
+                    continue
                 merged_symbols[name] = {
                     "name": name,
                     "address": sym["address"],
@@ -411,6 +479,10 @@ class A2LGenerator:
         if name.startswith("L."):
             return False
         if sym["address"] == 0:
+            return False
+        if re.match(r"^_?0x[0-9a-fA-F]+$", name):
+            return False
+        if not re.match(r"^[a-zA-Z_]", name):
             return False
         return True
 
@@ -513,10 +585,17 @@ class A2LGenerator:
             addr = sec["addr"]
             size = sec["size"]
             if addr > 0 and size > 0:
+                sec_name = sec["name"]
+                is_writable = any(
+                    wa in sec_name
+                    for wa in [".data", ".bss", ".noinit", ".heap", ".stack", ".sbss", ".sdata"]
+                )
+                prg_type = "PRG_DATA" if is_writable else "PRG_CODE"
+                data_type = "DTY_VARIABLE" if is_writable else "DTY_FLASH"
                 lines.append(f"      BEGIN_MEMORY_SEGMENT {seg_name}")
                 lines.append(f'        "{sec["name"]} section"')
-                lines.append(f"        PRG_TYPE PRG_CODE")
-                lines.append(f"        DATA_TYPE DTY_FLASH")
+                lines.append(f"        PRG_TYPE {prg_type}")
+                lines.append(f"        DATA_TYPE {data_type}")
                 lines.append(f"        BEGIN_IF_DATA ADDRESS")
                 lines.append(f"          0x{addr:08X}")
                 lines.append(f"          0x{addr + size:08X}")
@@ -554,8 +633,9 @@ class A2LGenerator:
             lines.append(f"    BEGIN_COMPU_METHOD {self._escape(cm_name)}")
             lines.append(f'      "{cm_info["info"]}"')
             lines.append(f"      {cm_info['type']}")
-            lines.append(f'      COMPU_TAB_REF "{cm_name}_TAB"')
-            lines.append("")
+
+            if cm_info["type"] != "IDENTICAL":
+                lines.append(f'      COMPU_TAB_REF "{cm_name}_TAB"')
 
             if cm_info["type"] == "LINEAR" and "coeffs" in cm_info:
                 for factor, offset in cm_info["coeffs"]:
@@ -567,26 +647,25 @@ class A2LGenerator:
             lines.append("")
 
     def _write_record_layouts(self, lines):
+        type_map = {
+            "RL_UBYTE": "UBYTE",
+            "RL_SBYTE": "SBYTE",
+            "RL_UWORD": "UWORD",
+            "RL_SWORD": "SWORD",
+            "RL_ULONG": "ULONG",
+            "RL_SLONG": "SLONG",
+            "RL_FLOAT32": "FLOAT32",
+            "RL_FLOAT64": "FLOAT64",
+            "RL_AULONGLONG": "A_ULONGLONG",
+            "RL_A_SLONGLONG": "A_SLONGLONG",
+        }
         for rl_name, rl_info in self.record_layouts.items():
-            size = rl_info["size"]
             lines.append(f"    BEGIN_RECORD_LAYOUT {self._escape(rl_name)}")
             lines.append(f'      "{rl_name} record layout"')
             lines.append("")
 
-            if size == 1:
-                lines.append("      FNC_VALUES 1 UBYTE COLUMN_DIR DIRECT")
-            elif size == 2:
-                lines.append("      FNC_VALUES 1 UWORD COLUMN_DIR DIRECT")
-            elif size == 4:
-                if "FLOAT" in rl_name:
-                    lines.append("      FNC_VALUES 1 FLOAT32 COLUMN_DIR DIRECT")
-                else:
-                    lines.append("      FNC_VALUES 1 ULONG COLUMN_DIR DIRECT")
-            elif size == 8:
-                if "FLOAT" in rl_name:
-                    lines.append("      FNC_VALUES 1 FLOAT64 COLUMN_DIR DIRECT")
-                else:
-                    lines.append("      FNC_VALUES 1 A_ULONGLONG COLUMN_DIR DIRECT")
+            dtype = type_map.get(rl_name, "ULONG")
+            lines.append(f"      FNC_VALUES 1 {dtype} COLUMN_DIR DIRECT")
 
             lines.append("    END_RECORD_LAYOUT")
             lines.append("")
